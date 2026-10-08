@@ -2316,6 +2316,37 @@ namespace Mem {
 	bool zfs_collect_pool_total_stats(struct disk_info &disk);
 	bool zfs_collect_pool_space_stats(std::string_view pool_name, struct disk_info &disk);
 
+	void update_io_rates(disk_info& disk, int64_t bytes_read, int64_t bytes_write) {
+		const auto now = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration<double>(now - disk.last_io_sample).count();
+		const auto rate = [elapsed](int64_t current, int64_t previous) -> long long {
+			if (elapsed <= 0 or current <= previous) return 0;
+			const auto bytes_per_second = static_cast<long double>(current - previous) / elapsed;
+			return bytes_per_second >= numeric_limits<long long>::max()
+				? numeric_limits<long long>::max() : static_cast<long long>(bytes_per_second);
+		};
+
+		disk.io_read.push_back(disk.io_read.empty() ? 0 : rate(bytes_read, disk.old_io.at(0)));
+		disk.io_write.push_back(disk.io_write.empty() ? 0 : rate(bytes_write, disk.old_io.at(1)));
+		disk.old_io.at(0) = bytes_read;
+		disk.old_io.at(1) = bytes_write;
+		disk.last_io_sample = now;
+		while (cmp_greater(disk.io_read.size(), width * 2)) disk.io_read.pop_front();
+		while (cmp_greater(disk.io_write.size(), width * 2)) disk.io_write.pop_front();
+	}
+
+	void update_io_latency(disk_info& disk, int64_t reads, int64_t read_ms, int64_t writes, int64_t write_ms) {
+		const auto latency = [](int64_t ops, int64_t old_ops, int64_t time, int64_t old_time) -> double {
+			return ops > old_ops and time >= old_time
+				? static_cast<double>(time - old_time) / static_cast<double>(ops - old_ops) : 0.0;
+		};
+		disk.read_latency_ms = disk.read_latency_ms
+			? latency(reads, disk.old_latency_io.at(0), read_ms, disk.old_latency_io.at(1)) : 0.0;
+		disk.write_latency_ms = disk.write_latency_ms
+			? latency(writes, disk.old_latency_io.at(2), write_ms, disk.old_latency_io.at(3)) : 0.0;
+		disk.old_latency_io = {reads, read_ms, writes, write_ms};
+	}
+
 	mem_info current_mem {};
 
 	uint64_t get_totalMem() {
@@ -2659,7 +2690,7 @@ namespace Mem {
 				disk_ios = 0;
 				for (auto& [ignored, disk] : disks) {
 					if (disk.stat.empty() or access(disk.stat.c_str(), R_OK) != 0) continue;
-					if (disk.fstype == "zfs" && zfs_hide_datasets && zfs_collect_pool_total_stats(disk)) {
+					if (disk.fstype == "zfs" and zfs_hide_datasets and is_directory(disk.stat) and zfs_collect_pool_total_stats(disk)) {
 						disk_ios++;
 						continue;
 					}
@@ -2667,7 +2698,9 @@ namespace Mem {
 					if (diskread.good()) {
 						disk_ios++;
 						//? ZFS Pool Support
-						if (disk.fstype == "zfs") {
+						if (disk.fstype == "zfs" and not disk.stat.native().starts_with("/sys/block/")) {
+							disk.read_latency_ms.reset();
+							disk.write_latency_ms.reset();
 							// skip first three lines
 							for (int i = 0; i < 3; i++) diskread.ignore(numeric_limits<streamsize>::max(), '\n');
 							// skip characters until '4' is reached, indicating data type 4, next value will be out target
@@ -2677,12 +2710,6 @@ namespace Mem {
 							// skip characters until '4' is reached, indicating data type 4, next value will be out target
 							diskread.ignore(numeric_limits<streamsize>::max(), '4');
 							diskread >> sectors_write; // nbytes written
-							if (disk.io_write.empty())
-								disk.io_write.push_back(0);
-							else
-								disk.io_write.push_back(max((int64_t)0, (sectors_write - disk.old_io.at(1))));
-							disk.old_io.at(1) = sectors_write;
-							while (cmp_greater(disk.io_write.size(), width * 2)) disk.io_write.pop_front();
 
 							// skip characters until '4' is reached, indicating data type 4, next value will be out target
 							diskread.ignore(numeric_limits<streamsize>::max(), '4');
@@ -2692,12 +2719,7 @@ namespace Mem {
 							// skip characters until '4' is reached, indicating data type 4, next value will be out target
 							diskread.ignore(numeric_limits<streamsize>::max(), '4');
 							diskread >> sectors_read; // nbytes read
-							if (disk.io_read.empty())
-								disk.io_read.push_back(0);
-							else
-								disk.io_read.push_back(max((int64_t)0, (sectors_read - disk.old_io.at(0))));
-							disk.old_io.at(0) = sectors_read;
-							while (cmp_greater(disk.io_read.size(), width * 2)) disk.io_read.pop_front();
+							update_io_rates(disk, sectors_read, sectors_write);
 
 							if (disk.io_activity.empty())
 								disk.io_activity.push_back(0);
@@ -2706,32 +2728,18 @@ namespace Mem {
 							disk.old_io.at(2) = io_ticks;
 							while (cmp_greater(disk.io_activity.size(), width * 2)) disk.io_activity.pop_front();
 						} else {
-							for (int i = 0; i < 2; i++) { diskread >> std::ws; diskread.ignore(SSmax, ' '); }
-							diskread >> sectors_read;
-							if (disk.io_read.empty())
-								disk.io_read.push_back(0);
-							else
-								disk.io_read.push_back(max((int64_t)0, (sectors_read - disk.old_io.at(0)) * 512));
-							disk.old_io.at(0) = sectors_read;
-							while (cmp_greater(disk.io_read.size(), width * 2)) disk.io_read.pop_front();
-
-							for (int i = 0; i < 3; i++) { diskread >> std::ws; diskread.ignore(SSmax, ' '); }
-							diskread >> sectors_write;
-							if (disk.io_write.empty())
-								disk.io_write.push_back(0);
-							else
-								disk.io_write.push_back(max((int64_t)0, (sectors_write - disk.old_io.at(1)) * 512));
-							disk.old_io.at(1) = sectors_write;
-							while (cmp_greater(disk.io_write.size(), width * 2)) disk.io_write.pop_front();
-
-							for (int i = 0; i < 2; i++) { diskread >> std::ws; diskread.ignore(SSmax, ' '); }
-							diskread >> io_ticks;
-							if (uptime == old_uptime || disk.io_activity.empty())
-								disk.io_activity.push_back(0);
-							else
-								disk.io_activity.push_back(clamp((long)round((double)(io_ticks - disk.old_io.at(2)) / (uptime - old_uptime) / 10), 0l, 100l));
-							disk.old_io.at(2) = io_ticks;
-							while (cmp_greater(disk.io_activity.size(), width * 2)) disk.io_activity.pop_front();
+							int64_t reads, read_ms, writes, write_ms, ignored;
+							if (diskread >> reads >> ignored >> sectors_read >> read_ms
+								>> writes >> ignored >> sectors_write >> write_ms >> ignored >> io_ticks) {
+								update_io_rates(disk, sectors_read * 512, sectors_write * 512);
+								update_io_latency(disk, reads, read_ms, writes, write_ms);
+								if (uptime == old_uptime || disk.io_activity.empty())
+									disk.io_activity.push_back(0);
+								else
+									disk.io_activity.push_back(clamp((long)round((double)(io_ticks - disk.old_io.at(2)) / (uptime - old_uptime) / 10), 0l, 100l));
+								disk.old_io.at(2) = io_ticks;
+								while (cmp_greater(disk.io_activity.size(), width * 2)) disk.io_activity.pop_front();
+							}
 						}
 					} else {
 						Logger::debug("Error in Mem::collect() : when opening {}", disk.stat);
@@ -2835,6 +2843,8 @@ namespace Mem {
 	}
 
 	bool zfs_collect_pool_total_stats(struct disk_info &disk) {
+		disk.read_latency_ms.reset();
+		disk.write_latency_ms.reset();
 		ifstream diskread;
 
 		int64_t bytes_read;
@@ -2888,19 +2898,7 @@ namespace Mem {
 		// if for some reason no objects were read
 		if (objects_read == 0) return false;
 
-		if (disk.io_write.empty())
-			disk.io_write.push_back(0);
-		else
-			disk.io_write.push_back(max((int64_t)0, (bytes_write_total - disk.old_io.at(1))));
-		disk.old_io.at(1) = bytes_write_total;
-		while (cmp_greater(disk.io_write.size(), width * 2)) disk.io_write.pop_front();
-
-		if (disk.io_read.empty())
-			disk.io_read.push_back(0);
-		else
-			disk.io_read.push_back(max((int64_t)0, (bytes_read_total - disk.old_io.at(0))));
-		disk.old_io.at(0) = bytes_read_total;
-		while (cmp_greater(disk.io_read.size(), width * 2)) disk.io_read.pop_front();
+		update_io_rates(disk, bytes_read_total, bytes_write_total);
 
 		if (disk.io_activity.empty())
 			disk.io_activity.push_back(0);

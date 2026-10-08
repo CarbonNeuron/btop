@@ -1396,6 +1396,13 @@ namespace Mem {
 			const auto& disks = mem.disks;
 			cx = mem_width; cy = 0;
 			bool big_disk = disks_width >= 25;
+			const auto with_latency = [max_width = disks_width](string rate, const std::optional<double>& latency) {
+				if (latency) {
+					const auto label = fmt::format("{} ({:.1f}ms)", rate, *latency);
+					if (cmp_less_equal(ulen(label), max_width)) return label;
+				}
+				return rate;
+			};
 			divider = Mv::l(1) + Theme::c("div_line") + Symbols::div_left + Symbols::h_line * disks_width + Theme::c("mem_box") + Fx::ub + Symbols::div_right + Mv::l(disks_width);
 			const string hu_div = Theme::c("div_line") + Symbols::h_line + Theme::c("main_fg");
 			if (io_mode) {
@@ -1419,8 +1426,12 @@ namespace Mem {
 					if (io_graph_combined) {
 						if (not io_graphs.contains(mount)) continue;
 						auto comb_val = disk.io_read.back() + disk.io_write.back();
-						const string humanized = (disk.io_write.back() > 0 ? "▼"s : ""s) + (disk.io_read.back() > 0 ? "▲"s : ""s)
-												+ (comb_val > 0 ? Mv::r(1) + floating_humanizer(comb_val, true) : "RW");
+						string humanized = (disk.io_write.back() > 0 ? "▼"s : ""s) + (disk.io_read.back() > 0 ? "▲"s : ""s)
+												+ (comb_val > 0 ? " " + floating_humanizer(comb_val, true) : "RW");
+						if (disk.read_latency_ms and disk.write_latency_ms) {
+							const auto latencies = fmt::format(" R{:.1f} W{:.1f}ms", *disk.read_latency_ms, *disk.write_latency_ms);
+							if (cmp_less_equal(ulen(humanized) + latencies.size(), disks_width)) humanized += latencies;
+						}
 						if (disks_io_h == 1) out += Mv::to(y+1+cy, x+1+cx) + string(5, ' ');
 						out += Mv::to(y+1+cy, x+1+cx) + io_graphs.at(mount)({comb_val}, redraw or data_same)
 							+ Mv::to(y+1+cy, x+1+cx) + Theme::c("main_fg") + humanized;
@@ -1428,8 +1439,8 @@ namespace Mem {
 					}
 					else {
 						if (not io_graphs.contains(mount + "_read") or not io_graphs.contains(mount + "_write")) continue;
-						const string human_read = (disk.io_read.back() > 0 ? "▲" + floating_humanizer(disk.io_read.back(), true) : "R");
-						const string human_write = (disk.io_write.back() > 0 ? "▼" + floating_humanizer(disk.io_write.back(), true) : "W");
+						const string human_read = with_latency(disk.io_read.back() > 0 ? "▲" + floating_humanizer(disk.io_read.back(), true) : "R", disk.read_latency_ms);
+						const string human_write = with_latency(disk.io_write.back() > 0 ? "▼" + floating_humanizer(disk.io_write.back(), true) : "W", disk.write_latency_ms);
 						if (disks_io_h <= 3) out += Mv::to(y+1+cy, x+1+cx) + string(5, ' ') + Mv::to(y+cy + disks_io_h, x+1+cx) + string(5, ' ');
 						out += Mv::to(y+1+cy, x+1+cx) + io_graphs.at(mount + "_read")(disk.io_read, redraw or data_same) + Mv::l(disks_width)
 							+ Mv::d(1) + io_graphs.at(mount + "_write")(disk.io_write, redraw or data_same)

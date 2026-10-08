@@ -20,6 +20,7 @@ tab-size = 4
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -282,9 +283,13 @@ namespace Mem {
 		int free_percent{};
 
 		array<int64_t, 3> old_io = {0, 0, 0};
+		std::chrono::steady_clock::time_point last_io_sample{};
 		deque<long long> io_read = {};
 		deque<long long> io_write = {};
 		deque<long long> io_activity = {};
+		array<int64_t, 4> old_latency_io = {0, 0, 0, 0};
+		std::optional<double> read_latency_ms{};
+		std::optional<double> write_latency_ms{};
 	};
 
 	struct mem_info {
